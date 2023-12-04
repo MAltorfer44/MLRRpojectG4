@@ -43,7 +43,7 @@ hyperparameter_grid <- expand.grid(
 
 # only run if you want to. may take a while
 
-# model <- train(DRK_YN ~ .,  #  target variable on all the features
+model <- train(DRK_YN ~ .,  #  target variable on all the features
                data = train,  #  dataset
                method = "ranger",
                trControl = train_control,
@@ -51,7 +51,7 @@ hyperparameter_grid <- expand.grid(
                metric = "ROC",
                num.trees = 500)
 
-#save(model, file="model.RData")
+save(model, file="model.RData")
 load("model.RData")
 
 res_RF = model$results
@@ -68,7 +68,7 @@ print(head(res_RF))
 
 
 # train another ranger anyway 
-#bm_ranger= ranger(DRK_YN ~ .,  #  target variable on all the features
+bm_ranger= ranger(DRK_YN ~ .,  #  target variable on all the features
                   data = train,  #  dataset
                   mtry =res_RF$mtry[1], # same as model$bestTune$mtry
                   splitrule = res_RF$splitrule[1],
@@ -93,7 +93,7 @@ bm_RandomForest <- randomForest(DRK_YN ~ .,  #  target variable on all the featu
                                 probability = T)
 
 
-#save(bm_ranger, bm_RandomForest,file="bm.RData")
+save(bm_ranger, bm_RandomForest,file="bm.RData")
 
 load("bm.RData")
 
