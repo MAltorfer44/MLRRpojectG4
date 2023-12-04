@@ -1,0 +1,517 @@
+---
+title: "ML Project"
+author: "Michael Altorfer, 18-605-345, Špela Rojht 22-601-496, Thomas Noël 19-614-213"
+date: "17. November 2023"
+output: 
+  html_document:
+    code_folding: hide
+    toc: yes
+    toc_depth: 3
+---
+<br>
+<br>
+<br>
+    
+  
+***
+  
+        
+
+  
+
+
+\pagebreak
+
+# 1 Data Inspection and Cleaning
+
+Our data consist of medical information of almost one million participants. We decided to try to develop a model that would predict whether the person is a drinker or not based on the rest of his medical characteristics. We believe this could be a great prediction model for insurance companies, that want to understand the riskiness of their portfolio based on the drinking behaviour of their policyholders.
+
+Because our model includes almost 1 mio observations, we made some measures to make the processing smoother (only taking 5 % of the whole dataset as a train set). Nevertheless, some of the codes still take a long time to process (we used # before those lines). Therefore we stored the results of those codes in separate files and used them in the following chunks to be able to continue with programming without having to run the processing. 
+
+Chapter one describes how we prepared the data for further modelling. Please find the dataset and a description of all variables on: https://www.kaggle.com/datasets/sooyoungher/smoking-drinking-dataset/data
+
+```{r setup, warning=FALSE,echo=FALSE,results='hide',message=FALSE}
+library(tidyverse)
+library(ggplot2)
+library(patchwork)
+library(readr)
+library(caTools)
+library(rpart)
+library(iml)
+library(pdp)
+library(ranger)
+library(mlr3)
+library(mlr3pipelines)
+library(mlr3learners)
+library(mlr3viz)
+library(mlr3tuning)
+library(caret)
+library(randomForest)
+```
+
+In a first step, we load the data and take a look at the summary.
+
+```{r,warning=FALSE,results='hide',message=FALSE}
+data <- as.data.frame(read_csv("smoke.csv"))
+```
+
+
+```{r}
+summary(data)
+head(data)
+tail(data)
+
+```
+The summary shows that some features need to be encoded as factors instead of characters or numerics (based on variable description availabe at source). Moreover, we see that all people in the datasets are adults and that the waistline is for some observations impossible.
+
+Hence, we exclude these observations and we also check the dimensions of the data and if it contains NAs.
+
+```{r}
+
+# from characters or numerics to factors
+data$sex =as.factor(data$sex)
+data$DRK_YN = as.factor(data$DRK_YN)
+data$hear_left = as.factor(data$hear_left)
+data$hear_right = as.factor(data$hear_right)
+data$urine_protein = as.factor(data$urine_protein)
+data$SMK_stat_type_cd = as.factor(data$SMK_stat_type_cd)
+str(data)
+
+# Check the distribution with box plots
+
+boxplot(data$age)
+boxplot(data$height)
+boxplot(data$weight)
+boxplot(data$sight_left)
+boxplot(data$sight_right)
+boxplot(data$waistline)
+boxplot(data$SBP)
+boxplot(data$DBP)
+boxplot(data$BLDS)
+boxplot(data$tot_chole)
+boxplot(data$HDL_chole)
+boxplot(data$LDL_chole)
+boxplot(data$triglyceride)
+boxplot(data$hemoglobin)
+boxplot(data$serum_creatinine)
+boxplot(data$SGOT_AST)
+boxplot(data$SGOT_ALT)
+boxplot(data$gamma_GTP)
+
+# remove the unrealistic observations
+data=data[data$waistline>20 & data$waistline<200,]
+
+cat("dimesnions: ",dim(data)) # almost one million observations
+
+# -> No NAs
+cat("Total NAs in DF: ",sum(sapply(data, function(y) sum(length(which(is.na(y)))))) )
+```
+
+Let's check if the data looks clean now.
+```{r}
+
+summary(data)
+
+```
+
+Looks good so far. In a next step we'll take a quick look at the correlation of the numeric features.
+```{r}
+# check correlation
+numeric_columns <- sapply(data, is.numeric)
+
+# Subset the dataframe to include only numeric columns
+numeric_data <- data[, numeric_columns]
+
+# Calculate the correlation of numeric variables
+correlation_matrix <- cor(numeric_data)
+
+# show a nice plot 
+# -> blue positive corr, red negative corr
+corrplot::corrplot(correlation_matrix)
+```
+LDL and total cholesterol seem to be highly correlated. Moreover, SBP and DBP also show high multicollinearity. Depending on our modelling strategy we have to keep this in mind and might have to exclude one of the two.
+  
+Let's inspect the data in more detail.
+
+We see that men and young people seem to be more likely to be drinkers.
+
+```{r}
+tab=table(data$DRK_YN, data$sex)
+
+cat("male drinkers:" , tab[2,2]/sum(tab[,2]))
+cat("female drinkers:" , tab[2,1]/sum(tab[,1]))
+
+# younger more likely to be alcoholic
+ggplot(data)+
+  geom_boxplot(aes(age))+
+  facet_wrap(~DRK_YN)+
+  coord_flip()
+
+```
+
+
+# 2 Data Preparation 
+
+Thinking of the business case it might be that not all features are available for insurance company. Thus, we group them in three groups. Group one is always available (insurance company knows basic medical characteristics of policyholders). Group two only requires a check-up and group three needs a blood and urine sample.
+
+```{r}
+# outcome
+outcome = "DRK_YN"
+
+# features that are available or relatively easy to get
+feat_available = c("sex","age","height","weight", "sight_left", "sight_right")
+
+# features that just need a small test and no blood/urine sample
+feat_maybe = c("waistline","hear_left","hear_right","SBP","DBP")
+
+
+# features that would need a blood or urine test 
+# or require honest self disclosure (smoking variable) 
+# -> Do we believe that bad risks will be honest?
+
+# colnames of the whole dataset
+data_names=names(data)
+
+# remove subgroups from above
+feat_other = setdiff(data_names, c(feat_available, feat_maybe, outcome))
+
+#check if no column was forgotten
+length(feat_other)+length(feat_maybe)+
+  length(feat_available)+length(outcome)-length(data_names)== 0
+
+```
+
+The check shows that no variable has gone missing.
+Now, we first select the features that should be present in the model and then we split the data into a train, tune, test set and into a hold-out dataset. We can only work with 5% of the data due to limited computing power (total no. of observation is too large for smooth processing). The remaining 95% will be used in the end to check one more time how the models perform on unseen data.
+
+```{r}
+# choose the features we want to work with in the models
+data = data%>%
+  dplyr::select(all_of(
+    c(outcome, feat_available,feat_maybe)))
+    # feat_other not included due to limited availability in real life
+   
+
+
+# prevalence is almost 50% -> balanced 
+# no need for under or oversampling. Large enough that stratification is not necessary
+sum(data[,outcome]=="Y")/nrow(data)
+
+# reproducibility
+set.seed(123)
+
+# train percentage
+perc=0.05 # no more possible cause our RAM can't handle it
+
+# create a vector with the row index for the train data
+train_set = sample(seq_len(nrow(data)), 
+                   size = perc*nrow(data), 
+                   replace = F # alternatively replace = T
+)
+
+train=data[train_set,]
+
+# subtract train to get test (mutually exclusive datasets)
+# test = hold out data
+test=data[-train_set,]
+
+```
+
+# 3 Modelling
+
+Note, we do not use the parallelization technique discussed in the lecture as it leads to failure of the code. Could be that our machines (4 cores, 8 GB Ram) ~5 years old are just not up to the task.
+
+In a first step let's compute dummy model. This is basically the same as calculating the prevalence.
+```{r}
+cat("MMCE of Dummy model: ", 1 - sum(data[,outcome]=="Y")/nrow(data))
+dummy <- 1 - sum(data[,outcome]=="Y")/nrow(data)
+
+```
+
+In a second step we train and test a logistic regression as a baseline model to get an understanding on strength of the pattern in the data. 
+```{r}
+# Training model
+logistic_model <- glm(DRK_YN ~ ., 
+                      data = train, family = 'binomial')
+
+predict_reg <- predict(logistic_model, 
+                       test, type = "response")
+
+# We want to have everything above s as a 1
+# Depending on our sensitivity specificity preference
+# we can increase/decrease as we want
+s=0.5
+predict_reg01 <- ifelse(predict_reg > s, 1, 0)
+
+
+confusion_matrix = table(predict_reg01, test$DRK_YN)
+# print confusion matrix
+confusion_matrix
+
+# calc MMCE, Acc, Sens and Spec
+logreg_mmce = 1 - (sum(diag(confusion_matrix))/sum(confusion_matrix))
+logreg_accuracy = (sum(diag(confusion_matrix))/sum(confusion_matrix))
+sens = confusion_matrix[2,2]/sum(confusion_matrix[,2])
+spec = confusion_matrix[1,1]/sum(confusion_matrix[,1])
+cat('MMCE',(logreg_mmce),'-', 
+    'Accuracy', logreg_accuracy,'-',
+    'Sensitivity', sens,'-', 
+    'Specificity', spec)
+
+
+rm(predict_reg01)
+rm(predict_reg)
+
+```
+The results of the logistic regression show that the variables have some explanatory power but there still seems to be some upside potential.
+
+Now let's take a look how the MLR models perform. First, we train, tune and test a decision tree and second we will do the same procedure for a random forest (RF).
+
+```{r, eval=FALSE}
+
+# define task
+task_rf = TaskClassif$new(id = "train", backend = train, 
+                          target = "DRK_YN", positive = "Y")
+
+# define learner -> Tune pruning parameter
+learner = lrn("classif.rpart",
+              cp = to_tune(0.00003, 0.3))
+
+# create auto tuner
+at = auto_tuner(
+  tuner = tnr("random_search"),
+  learner = learner,
+  resampling = rsmp ("cv", folds=5),
+  measure = msr("classif.ce"),
+  term_evals = 20)
+
+resampling_outer = rsmp("cv", folds = 10)
+
+# takes a while to run
+#rr_tree = resample(task_rf, at, resampling_outer, store_models = TRUE). #Result stored in file treeRes.RData, in case you don't want to run it, load the file in the next chunk (see line 303)
+
+results_mlr_tree = as_tibble(extract_inner_tuning_results(rr_tree))
+
+results_mlr_tree=results_mlr_tree%>%
+  arrange(classif.ce)
+
+```
+
+Let's take a look at the performance of the final model that is trained on the full training data with the optimal hyperparameter.
+```{r}
+load("treeRes.RData")
+# define task -> chunk above is not run in RMD due to computational limitations.
+# Hence specified again
+task_rf = TaskClassif$new(id = "train", backend = train, 
+                          target = "DRK_YN", positive = "Y")
+tr = lrn("classif.rpart",
+           cp = results_mlr_tree$cp[1])
+
+# new data might contain NAs
+imputer = po("imputemedian") # define a pipeline object for imputation
+tr = as_learner(imputer %>>% tr)
+
+# train
+mod_tr = tr$train(task_rf)
+
+# predit on the hold out data (95 %)
+predtr=predict(mod_tr, newdata = test)
+
+# relevel needed for caret to work -> order must be the same (binomial variables should be always the same order: Y, N)
+predtr=relevel(predtr,"N")
+#create confusion matrix
+conf_mat_tr=table(predtr, test$DRK_YN)
+
+# print results
+confusionMatrix(conf_mat_tr)
+```
+
+We observe a very similar performance than the LogReg. Now let's take a look at the random forest before we will conduct a benchmarking experiment to assess, which one is the optimal model and if the tuning of the decision tre and RF actually lead to a performance improvement.
+
+The process is almost one to one the same as for the decision tree with the only difference that other hyperparameters need to be tuned. Note, by including sample.fraction we are able to further decorrelated the trees and increase the randomness in our RF. Moreover, it enables us to use 5 instead of only 1 percent of the available data to train and tune the RF.
+```{r, eval=FALSE}
+#The chunk is eval=FALSE because is computationally intensive. Therefore we store the end result in the file CM_RF.RData, which is used in the next chunk for confusion matrix
+
+task_rf = TaskClassif$new(id = "train", backend = train, 
+                          target = "DRK_YN", positive = "Y")
+
+learner = lrn("classif.ranger",
+              mtry = to_tune(ncol(train)%/%5, ncol(train)%/%1.5),
+              min.node.size = to_tune(1,15),
+              sample.fraction = to_tune(0.02,0.2),
+              num.trees = to_tune(500,1500))
+
+# create auto tuner
+at = auto_tuner(
+  tuner = tnr("random_search"),
+  learner = learner,
+  resampling = rsmp ("cv", folds=4),
+  measure = msr("classif.ce"),
+  term_evals = 5)
+
+resampling_outer = rsmp("cv", folds = 10)
+
+# takes a while to run
+#rr = resample(task_rf, at, resampling_outer, store_models = TRUE). #result stored in the file mlrTuned.RData, see line 363
+
+results_mlr = as_tibble(extract_inner_tuning_results(rr))
+
+results_mlr=results_mlr%>%
+  arrange(classif.ce)
+
+load("mlrTuned.RData") 
+
+# learner with optimal hyperparameters
+rf_t = lrn("classif.ranger",mtry=results_mlr$mtry[1], 
+           min.node.size=results_mlr$min.node.size[1],
+           num.trees = results_mlr$num.trees[1],
+           sample.fraction = results_mlr$sample.fraction[1])
+
+# new data might contain NAs
+rf_t = as_learner(imputer %>>% rf_t)
+
+mod_RF = rf_t$train(task_rf)
+
+predRF=predict(mod_RF, newdata = test)
+
+# relevel needed for caret to work -> order must be the same
+predRF=relevel(predRF,"N")
+#create confusion matrix
+conf_mat_RF=table(predRF, test$DRK_YN)
+
+#save(conf_mat_RF,file="CM_RF.RData") 
+```
+
+```{r}
+
+load("CM_RF.RData")
+confusionMatrix(conf_mat_RF)
+```
+
+Again it looks like the performance is very similar. Hence, the benchmarking will be interesting to evaluate the final model is it does not seem to be clear a priori.
+
+In the next chapter we will focus on the benchmarking before we will take a look at several plots to understand the drivers of the predictions.
+
+# 4 Benchmarking
+
+We use new data in the benchmarking following the chinese wall principle. 
+```{r, eval=FALSE}
+# benchmarking is done on new data that was not previously used to tune the RF and tree
+
+# train percentage
+perc=0.05 # no more possible cause my RAM can't handle it
+
+# create a vector with the row index for the train data
+train_set = sample(seq_len(nrow(test)), 
+                   size = perc*nrow(test), 
+                   replace = F # alternatively replace = T
+)
+
+
+bm_data=data[train_set,]
+
+# define imputation
+imputer = po("imputemedian")
+
+# define task
+task_bm = TaskClassif$new(id = "BM", backend = bm_data, 
+                          target = "DRK_YN", positive = "Y")
+
+# define all the learners
+logreg = lrn("classif.log_reg")
+logreg = as_learner(imputer %>>% logreg)
+
+tree = lrn("classif.rpart")
+tree = as_learner(imputer %>>% tree)
+
+load("treeRes.RData") # tuned tree
+
+tr = lrn("classif.rpart",
+         cp = results_mlr_tree$cp[1])
+tr = as_learner(imputer %>>% tr)
+
+baseline = lrn("classif.featureless")
+
+
+rf_d = lrn("classif.ranger")
+rf_d = as_learner(imputer %>>% rf_d)
+
+
+rf_t = lrn("classif.ranger",mtry=results_mlr$mtry[1], 
+           min.node.size=results_mlr$min.node.size[1],
+           num.trees = results_mlr$num.trees[1],
+           sample.fraction = results_mlr$sample.fraction[1])
+rf_t = as_learner(imputer %>>% rf_t)
+
+design_class =  benchmark_grid(
+  tasks = task_bm,
+  learners = list(logreg, tree, tr, rf_d, rf_t),
+  resamplings = rsmp("cv", folds = 20)
+)
+
+
+# also takes a while to run
+#bm_class = benchmark(design_class, store_models = F) #data stored in benchmarkMLR.Rdata, see line 460
+
+
+```
+We exclude the dummy model from the plot as it fluctuates around 50 percent and is hence significantly worse than the other models. Moreover, the scaling of the plot would make it challenging to assess the boxplots of the other models as their performance is pretty similar.
+
+```{r}
+load("benchmarkMLR.Rdata")
+
+
+mes_class = msrs(c("classif.sensitivity","classif.specificity", "classif.acc", "classif.precision"))
+
+bmr_class = bm_class$aggregate(mes_class)
+df_bmr = as.data.table(bmr_class)
+
+  
+mlr3viz::autoplot(bm_class, measure = msr("classif.acc"))
+
+```
+
+The benchmarking leads to the following two findings:
+* The tuning of both models worked as they perform on median better than the default. However, the tuned tree has a higher variance thna the default, which is intuitively reasonable as the tuned decision tree is more flexible.
+* The logistic regression is on median the best model. Unexpectedly, it has a higher variance as the tuned RF. However, as it is the least complex model and its performance is at least as good as the one of the other models. We would recommend the LogReg.
+
+
+# 5 Plots
+In this chapter we visualize the results.
+
+Due to issues with the MLR plotting we use the "classic" RF packages instead - we used another package to develop the random forest model and use that one to plot the results (stored in bm.RData file).
+
+In a first step we load the trained models from the other RF packages. Note they are not exactly the same as the MLR RF but the impact on variable importance should be fairly limited.
+```{r}
+load("bm.RData")
+
+
+###################### Plots ##################################
+
+
+# variable importance
+impVars = bm_ranger$variable.importance%>%sort(decreasing = T)
+rm(bm_ranger)
+barplot(impVars, main = "Var importance", col = "grey", las = 2)
+varImpPlot(bm_RandomForest)
+
+
+# partial dependence plot based on RF from RandomForest library
+```
+We also look at the output of the LogReg and we find that the variable importance and the significance are mostly aligned. Moreover, the betas also indicate if a features is positively or negatively correlated to the outcome.
+```{r}
+summary(logistic_model)
+```
+
+
+```{r, eval=TRUE}
+
+pdp::partial(object=bm_RandomForest, pred.var = c("age", "sex"), plot = TRUE, chull = TRUE)
+
+partialPlot(bm_RandomForest, pred.data = train, x.var = "age")
+partial_plot <- pdp::partial(bm_RandomForest, pred.var = "age")
+
+```
+
+\pagebreak
+  
