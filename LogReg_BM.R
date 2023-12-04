@@ -132,6 +132,8 @@ for (i in c(1:k)){
   
 }
 
+#save(df_acc,df_sens,file = "LogR_BM.RData")
+load("LogR_BM.RData")
 a=boxplot(df_acc$all, df_acc$sexage, df_acc$min, df_acc$se,
         names = c("All variables", "Sex & age", "Lasso Min", "Lasso 1se"),
         main = "Benchmarking of different feature specifications",
@@ -141,5 +143,5 @@ b=boxplot(df_sens$all, df_sens$sexage, df_sens$min, df_sens$se,
         names = c("All variables", "Sex & age", "Lasso Min", "Lasso 1se"),
         main = "Benchmarking of different feature specifications",
         ylab = "Sensitivity")
-#save(a,b,file = "LogR_BM.RData")
+
 
